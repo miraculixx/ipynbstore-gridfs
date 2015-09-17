@@ -3,6 +3,8 @@
 from tornado import web
 import pymongo
 import gridfs
+import StringIO
+import json
 from IPython.html.services.contents.manager import ContentsManager
 from IPython.utils import tz
 from IPython import nbformat
@@ -23,6 +25,17 @@ class GridFSContentsManager(ContentsManager):
                             files are stored"
                             )
 
+    checkpoint_collection = Unicode('ipynb_checkpoints',
+                                    config=True,
+                                    help="Collection in mongo where notebook \
+                                    files are stored"
+                                    )
+
+    checkpoints_history = Unicode('ipynb_cphistory',
+                                config=True,
+                                help="Collection for checkpoints history"
+                                )
+
     def __init__(self, **kwargs):
         super(GridFSContentsManager, self).__init__(**kwargs)
         self.MONGODB_DETAILS = pymongo.uri_parser.parse_uri(self.mongo_uri)
@@ -38,6 +51,14 @@ class GridFSContentsManager(ContentsManager):
         Returns a mongo client instance
         """
         return pymongo.MongoClient(self.mongo_uri)
+
+    def _connect_collection(self, collection):
+        db = self._conn[self.database_name]
+
+        # Authenticate against database
+        if self.mongo_username and self.mongo_password:
+            db.authenticate(self.mongo_username, self.mongo_password)
+        return db[collection]
 
     def _get_fs_instance(self):
         """
@@ -143,6 +164,105 @@ class GridFSContentsManager(ContentsManager):
             model = self._file_model(path, content=content, format=format)
 
         return model
+
+    # # public checkpoint API
+    # def create_checkpoint(self, name, path=''):
+    #     path = path.strip('/')
+    #     spec = {
+    #         'path': path,
+    #     }
+
+    #     notebook = self._connect_collection(
+    #         self.nb_collection).find_one(spec)
+    #     chid = notebook['_id']
+    #     del notebook['_id']
+    #     cp_id = str(self._connect_collection(
+    #         self.checkpoint_collection).find(spec).count())
+
+    #     if self.checkpoints_history:
+    #         spec['cp'] = cp_id
+    #     else:
+    #         notebook['cp'] = cp_id
+    #         spec['id'] = chid
+
+    #     newnotebook = {'$set': notebook}
+
+    #     last_modified = notebook["lastModified"]
+    #     self.log.info("Saving checkpoint for notebook %s" % path)
+    #     self._connect_collection(
+    #         self.checkpoint_collection).update(spec, newnotebook, upsert=True)
+
+    #     # return the checkpoint info
+    #     return dict(id=cp_id, last_modified=last_modified)
+
+    # def list_checkpoints(self, path=''):
+    #     path = path.strip('/')
+    #     spec = {
+    #         'path': path,
+    #     }
+    #     checkpoints = list(self._connect_collection(
+    #         self.checkpoint_collection).find(spec))
+    #     return [dict(
+    #         id=c['cp'], last_modified=c['lastModified']) for c in checkpoints]
+
+    def save(self, model, path=''):
+        """Save the file model and return the model with no content."""
+        path = path.strip('/')
+
+        if 'type' not in model:
+            raise web.HTTPError(400, u'No file type provided')
+        if 'content' not in model and model['type'] != 'directory':
+            raise web.HTTPError(400, u'No file content provided')
+
+        # One checkpoint should always exist
+        # if self.file_exists(path) and not self.list_checkpoints(path):
+        #     self.create_checkpoint(path)
+
+        self.log.debug("Saving %s", path)
+
+        self.run_pre_save_hook(model=model, path=path)
+
+        try:
+            if model['type'] == 'notebook':
+                nb = nbformat.from_dict(model['content'])
+                self.check_and_sign(nb, path)
+                self._save_notebook(path, nb)
+                # One checkpoint should always exist for notebooks.
+                # if not self.list_checkpoints(path):
+                #     self.create_checkpoint(path)
+            elif model['type'] == 'file':
+                # Missing format will be handled internally by _save_file.
+                self._save_file(path, model['content'], model.get('format'))
+            elif model['type'] == 'directory':
+                self._save_directory(path, model, path)
+            else:
+                raise web.HTTPError(400, "Unhandled contents type: %s" % model['type'])
+        except web.HTTPError:
+            raise
+        except Exception as e:
+            self.log.error(u'Error while saving file: %s %s', path, e, exc_info=True)
+            raise web.HTTPError(500, u'Unexpected error while saving file: %s %s' % (path, e))
+
+        validation_message = None
+        if model['type'] == 'notebook':
+            self.validate_notebook_model(model)
+            validation_message = model.get('message', None)
+
+        model = self.get(path, content=False)
+        if validation_message:
+            model['message'] = validation_message
+
+        # self.run_post_save_hook(model=model, os_path=os_path)
+
+        return model
+
+    def _save_notebook(self, os_path, nb):
+        """Save a notebook to an gridFS."""
+        # self.log.error('%s', str(nb))
+        # f = StringIO.StringIO(ast.literal_eval(str(nb)))
+        self._get_fs_instance().put(json.dumps(nb, sort_keys=True), filename=os_path)
+            # files = open(nbformat.write(nb, f, version=nbformat.NO_CONVERT), 'r')
+            # self.log.errors("file is %s", files)
 
     def _base_model(self, path):
         """Build the common base of a contents model"""
