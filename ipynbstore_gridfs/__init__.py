@@ -3,7 +3,7 @@
 from tornado import web
 import pymongo
 import gridfs
-import StringIO
+import datetime
 import json
 from IPython.html.services.contents.manager import ContentsManager
 from IPython.utils import tz
@@ -13,28 +13,26 @@ from IPython.utils.traitlets import Unicode
 
 class GridFSContentsManager(ContentsManager):
 
-    mongo_uri = Unicode('mongodb://localhost:27017/',
-                        config=True,
-                        help="The URI to connect to the MongoDB instance. \
-                        Defaults to 'mongodb://localhost:27017/'"
-                        )
+    mongo_uri = Unicode(
+        'mongodb://localhost:27017/',
+        config=True,
+        help="The URI to connect to the MongoDB instance. \
+        Defaults to 'mongodb://localhost:27017/'")
 
-    nb_collection = Unicode('ipynb',
-                            config=True,
-                            help="Collection in mongo where notebook \
-                            files are stored"
-                            )
+    notebook_collection = Unicode(
+        'ipynb',
+        config=True,
+        help="Collection in mongo where notebook files are stored")
 
-    checkpoint_collection = Unicode('ipynb_checkpoints',
-                                    config=True,
-                                    help="Collection in mongo where notebook \
-                                    files are stored"
-                                    )
+    checkpoint_collection = Unicode(
+        'ipynb_checkpoints',
+        config=True,
+        help="Collection in mongo where notebook files are stored")
 
-    checkpoints_history = Unicode('ipynb_cphistory',
-                                config=True,
-                                help="Collection for checkpoints history"
-                                )
+    checkpoints_history = Unicode(
+        'ipynb_cphistory',
+        config=True,
+        help="Collection for checkpoints history")
 
     def __init__(self, **kwargs):
         super(GridFSContentsManager, self).__init__(**kwargs)
@@ -53,6 +51,9 @@ class GridFSContentsManager(ContentsManager):
         return pymongo.MongoClient(self.mongo_uri)
 
     def _connect_collection(self, collection):
+        """
+        Returns the collection
+        """
         db = self._conn[self.database_name]
 
         # Authenticate against database
@@ -67,7 +68,7 @@ class GridFSContentsManager(ContentsManager):
         try:
             db = getattr(pymongo.MongoClient(
                 self.mongo_uri), self.database_name)
-            fs = gridfs.GridFS(db, collection=self.nb_collection)
+            fs = gridfs.GridFS(db, collection=self.notebook_collection)
         except Exception, e:
             raise e
         return fs
@@ -95,8 +96,8 @@ class GridFSContentsManager(ContentsManager):
 
     def exists(self, path):
         """
-        Does a file exist at the given collection in gridFS?
-        Like os.path.exists
+        Does a file or dir exist at the given collection in gridFS?
+        We do not have dir so dir_exists returns true.
         Parameters
         ----------
         path : string
@@ -165,48 +166,52 @@ class GridFSContentsManager(ContentsManager):
 
         return model
 
-    # # public checkpoint API
-    # def create_checkpoint(self, name, path=''):
-    #     path = path.strip('/')
-    #     spec = {
-    #         'path': path,
-    #     }
+    # public checkpoint API
+    def create_checkpoint(self, path=''):
+        """
+        Creates a checkpoint for the notebook
+        """
+        path = path.strip('/')
+        spec = {
+            'path': path,
+        }
 
-    #     notebook = self._connect_collection(
-    #         self.nb_collection).find_one(spec)
-    #     chid = notebook['_id']
-    #     del notebook['_id']
-    #     cp_id = str(self._connect_collection(
-    #         self.checkpoint_collection).find(spec).count())
+        notebook = self._get_fs_instance().get_version(path)
+        chid = str(notebook._id)
+        cp_id = str(self._connect_collection(
+            self.checkpoint_collection).find(spec).count())
 
-    #     if self.checkpoints_history:
-    #         spec['cp'] = cp_id
-    #     else:
-    #         notebook['cp'] = cp_id
-    #         spec['id'] = chid
+        spec['cp'] = cp_id
+        spec['id'] = chid
+        last_modified = datetime.datetime.utcnow()
+        spec['lastModified'] = last_modified
 
-    #     newnotebook = {'$set': notebook}
+        newnotebook = {'$set': {'_id': chid}}
 
-    #     last_modified = notebook["lastModified"]
-    #     self.log.info("Saving checkpoint for notebook %s" % path)
-    #     self._connect_collection(
-    #         self.checkpoint_collection).update(spec, newnotebook, upsert=True)
+        self.log.info("Saving checkpoint for notebook %s" % path)
+        self._connect_collection(
+            self.checkpoint_collection).update(spec, newnotebook, upsert=True)
 
-    #     # return the checkpoint info
-    #     return dict(id=cp_id, last_modified=last_modified)
+        # return the checkpoint info
+        return dict(id=cp_id, last_modified=last_modified)
 
-    # def list_checkpoints(self, path=''):
-    #     path = path.strip('/')
-    #     spec = {
-    #         'path': path,
-    #     }
-    #     checkpoints = list(self._connect_collection(
-    #         self.checkpoint_collection).find(spec))
-    #     return [dict(
-    #         id=c['cp'], last_modified=c['lastModified']) for c in checkpoints]
+    def list_checkpoints(self, path=''):
+        """
+        lists all checkpoints for the notebook
+        """
+        path = path.strip('/')
+        spec = {
+            'path': path,
+        }
+        checkpoints = list(self._connect_collection(
+            self.checkpoint_collection).find(spec))
+        return [dict(
+            id=c['cp'], last_modified=c['lastModified']) for c in checkpoints]
 
     def save(self, model, path=''):
-        """Save the file model and return the model with no content."""
+        """
+        Save the file model and return the model with no content.
+        """
         path = path.strip('/')
 
         if 'type' not in model:
@@ -215,8 +220,8 @@ class GridFSContentsManager(ContentsManager):
             raise web.HTTPError(400, u'No file content provided')
 
         # One checkpoint should always exist
-        # if self.file_exists(path) and not self.list_checkpoints(path):
-        #     self.create_checkpoint(path)
+        if self.file_exists(path) and not self.list_checkpoints(path):
+            self.create_checkpoint(path)
 
         self.log.debug("Saving %s", path)
 
@@ -236,12 +241,15 @@ class GridFSContentsManager(ContentsManager):
             elif model['type'] == 'directory':
                 self._save_directory(path, model, path)
             else:
-                raise web.HTTPError(400, "Unhandled contents type: %s" % model['type'])
+                raise web.HTTPError(
+                    400, "Unhandled contents type: %s" % model['type'])
         except web.HTTPError:
             raise
         except Exception as e:
-            self.log.error(u'Error while saving file: %s %s', path, e, exc_info=True)
-            raise web.HTTPError(500, u'Unexpected error while saving file: %s %s' % (path, e))
+            self.log.error(
+                u'Error while saving file: %s %s', path, e, exc_info=True)
+            raise web.HTTPError(
+                500, u'Unexpected error while saving file: %s %s' % (path, e))
 
         validation_message = None
         if model['type'] == 'notebook':
@@ -252,17 +260,59 @@ class GridFSContentsManager(ContentsManager):
         if validation_message:
             model['message'] = validation_message
 
-        # self.run_post_save_hook(model=model, os_path=os_path)
-
         return model
 
+    def rename(self, old_path, new_path):
+        """
+        Renames a notebook
+        """
+        old_path = old_path.strip('/')
+        new_path = new_path.strip('/')
+        fs = self._get_fs_instance()
+        if new_path == old_path:
+            return
+
+        if self.file_exists(new_path):
+            raise web.HTTPError(409, u'Notebook already exists: %s' % new_path)
+
+        # Move the file
+        try:
+            grid_file = fs.get_version(old_path)._id
+            nb = nbformat.from_dict(
+                json.loads(fs.get(grid_file).read()))
+            fs.put(json.dumps(nb), filename=new_path)
+            self.delete(old_path)
+        except Exception as e:
+            raise web.HTTPError(500, u'Unknown error renaming file: %s %s' % (
+                old_path, e))
+
+        # Move the checkpoints
+        spec = {
+            'path': old_path,
+        }
+        modify = {
+            '$set': {
+                'path': new_path,
+            }
+        }
+        self._connect_collection(
+            self.checkpoint_collection).update(spec, modify, multi=True)
+
+    def delete(self, path):
+        """Delete notebook"""
+        if not self.file_exists(path):
+            print "hello"
+            return
+        path = path.strip('/')
+        fs = self._get_fs_instance()
+        gridfile = fs.get_version(path)._id
+        fs.delete(gridfile)
+
+
     def _save_notebook(self, os_path, nb):
-        """Save a notebook to an gridFS."""
-        # self.log.error('%s', str(nb))
-        # f = StringIO.StringIO(ast.literal_eval(str(nb)))
-        self._get_fs_instance().put(json.dumps(nb, sort_keys=True), filename=os_path)
-            # files = open(nbformat.write(nb, f, version=nbformat.NO_CONVERT), 'r')
-            # self.log.errors("file is %s", files)
+        """Saves a notebook to an gridFS."""
+        self._get_fs_instance().put(
+            json.dumps(nb, sort_keys=True), filename=os_path)
 
     def _base_model(self, path):
         """Build the common base of a contents model"""
