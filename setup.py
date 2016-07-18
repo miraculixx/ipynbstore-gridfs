@@ -36,8 +36,8 @@ setup(
         'Topic :: Internet :: WWW/HTTP :: Dynamic Content',
     ],
     install_requires=[
-        'pymongo==3.0.2',
-        'ipython>=3'
+        'pymongo>=3.0.2',
+        'ipython>=3,<4'
     ],
     dependency_links=[
     ]
